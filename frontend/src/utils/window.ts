@@ -1,10 +1,23 @@
 /** 天窗时间窗重叠检测、可用时长计算与人员机具占用校验 */
+import type { WorkOrderState } from '../types/workOrder';
 
 export interface TimeWindow {
   /** 时间窗起 yyyy-MM-dd HH:mm */
   windowStart: string;
   /** 时间窗止 yyyy-MM-dd HH:mm */
   windowEnd: string;
+}
+
+/**
+ * 仍占用人员机具的作业单状态。
+ * 已暂停（登记暂停即释放资源）与已完成（作业结束）的单不再占用，
+ * 冲突校验与「按当前空闲重查」都以该口径过滤。
+ */
+export const RESOURCE_HOLDING_STATES: WorkOrderState[] = ['planned', 'issued', 'working'];
+
+/** 该状态的作业单是否仍占用人员机具 */
+export function holdsResources(state: WorkOrderState): boolean {
+  return RESOURCE_HOLDING_STATES.includes(state);
 }
 
 /** "yyyy-MM-dd HH:mm" 解析为时间戳 */
@@ -80,6 +93,46 @@ export function findMachineConflicts(
     }
   }
   return [...conflicts];
+}
+
+export interface OccupiedResources {
+  /** 时间窗内被其它在办单占用的人员 */
+  members: string[];
+  /** 时间窗内被其它在办单占用的机具 */
+  machines: string[];
+  /** 占用来源作业单编号 */
+  orderCodes: string[];
+}
+
+/**
+ * 按当前空闲重查：统计指定时间窗内仍被在办单（待编排/已下达/作业中）占用的人员与机具。
+ * 已暂停、已完成的单已释放资源，不计入占用。
+ */
+export function occupiedResources(
+  target: TimeWindow & { id: string },
+  orders: Array<
+    TimeWindow & { id: string; code: string; state: WorkOrderState; members: string[]; machines: string[] }
+  >,
+): OccupiedResources {
+  const members = new Set<string>();
+  const machines = new Set<string>();
+  const orderCodes = new Set<string>();
+  for (const order of orders) {
+    if (order.id === target.id) continue;
+    if (!holdsResources(order.state)) continue;
+    if (!isOverlap(target, order)) continue;
+    let hit = false;
+    for (const member of order.members) {
+      members.add(member);
+      hit = true;
+    }
+    for (const machine of order.machines) {
+      machines.add(machine);
+      hit = true;
+    }
+    if (hit) orderCodes.add(order.code);
+  }
+  return { members: [...members], machines: [...machines], orderCodes: [...orderCodes] };
 }
 
 /**

@@ -19,7 +19,7 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -70,7 +70,7 @@ class RailSwitchDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；道岔补充轨型索引，病害补充组合索引便于按巡检批量操作，
     //     作业单补充负责人索引，并新增封锁条件表
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         yards: 'id, name, region, mileage',
         switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
@@ -111,6 +111,24 @@ class RailSwitchDatabase extends Dexie {
           }
           if (!Array.isArray(row.members)) row.members = [];
           if (!Array.isArray(row.machines)) row.machines = [];
+        });
+      });
+
+    // v3：作业单新增暂停登记字段（pauseReason / pausedAt），存量单补 null
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        yards: 'id, name, region, mileage',
+        switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+        inspections: 'id, switchId, date, inspector, [switchId+date]',
+        faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+        workOrders: 'id, code, state, windowStart, leader',
+        restrictions: 'id, yardId, switchCode',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('workOrders').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.pauseReason === undefined) row.pauseReason = null;
+          if (row.pausedAt === undefined) row.pausedAt = null;
         });
       });
   }
@@ -266,35 +284,73 @@ async function seedDatabase(): Promise<void> {
     });
   });
 
-  // 天窗作业单：为部分待修病害编排（同一时间窗刻意留一张不冲突、一张与人员冲突）
+  // 天窗作业单：为部分待修病害编排（同一时间窗刻意留一张不冲突、一张与人员冲突，
+  // 另加一张作业中、一张已暂停的演示单，暂停单首条病害按已处理销号）。
+  // 病害按队列依次分发，同一处病害不进两张演示单。
   const pendingFaults = faults.filter((item) => item.state === 'pending');
   const today = todayDate();
-  const groups: Array<{ faults: FaultRow[]; start: string; end: string; leader: string; state: WorkOrderRow['state'] }> = [
+  const faultQueue = [...pendingFaults];
+  const takeFaults = (count: number, pred: (item: FaultRow) => boolean = () => true): FaultRow[] => {
+    const picked: FaultRow[] = [];
+    for (const item of faultQueue) {
+      if (picked.length >= count) break;
+      if (pred(item)) picked.push(item);
+    }
+    const pickedIds = new Set(picked.map((item) => item.id));
+    for (let index = faultQueue.length - 1; index >= 0; index -= 1) {
+      if (pickedIds.has(faultQueue[index].id)) faultQueue.splice(index, 1);
+    }
+    return picked;
+  };
+  const groups: Array<{
+    faults: FaultRow[];
+    start: string;
+    end: string;
+    leader: string;
+    state: WorkOrderRow['state'];
+    pauseReason?: string;
+    pausedAt?: string;
+  }> = [
     {
-      faults: pendingFaults.filter((item) => item.severity !== 'light').slice(0, 3),
+      faults: takeFaults(3, (item) => item.severity !== 'light'),
       start: `${shiftDate(0)} 09:00`,
       end: `${shiftDate(0)} 11:30`,
       leader: '赵铁军',
-      state: 'issued',
+      state: 'working',
     },
     {
-      faults: pendingFaults.filter((item) => item.severity === 'light').slice(0, 2),
+      faults: takeFaults(2, (item) => item.severity === 'light'),
       start: `${shiftDate(0)} 10:00`,
       end: `${shiftDate(0)} 12:00`,
       leader: '孙立波',
       state: 'planned',
     },
     {
-      faults: pendingFaults.slice(3, 5),
+      faults: takeFaults(2),
       start: `${shiftDate(1)} 13:00`,
       end: `${shiftDate(1)} 15:00`,
       leader: '周振海',
       state: 'planned',
     },
+    {
+      faults: takeFaults(2),
+      start: `${shiftDate(-1)} 13:30`,
+      end: `${shiftDate(-1)} 16:00`,
+      leader: '吴长胜',
+      state: 'paused',
+      pauseReason: '捣固镐液压故障，等待备件进场',
+      pausedAt: `${shiftDate(-1)} 14:10`,
+    },
   ];
 
   groups.forEach((group, index) => {
     if (group.faults.length === 0) return;
+    // 暂停演示单：首条病害按「已处理」销号，体现暂停时的处理进度
+    if (group.state === 'paused' && group.pausedAt) {
+      const handled = group.faults[0];
+      handled.state = 'solved';
+      handled.solvedAt = group.pausedAt;
+    }
     workOrders.push({
       id: `wo-${index + 1}`,
       code: `TW-${today.replace(/-/g, '')}-${String(index + 1).padStart(2, '0')}`,
@@ -305,6 +361,8 @@ async function seedDatabase(): Promise<void> {
       machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
       members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
       state: group.state,
+      pauseReason: group.pauseReason ?? null,
+      pausedAt: group.pausedAt ?? null,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,

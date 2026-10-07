@@ -3,7 +3,7 @@
  * 勾选病害成单、分配时间窗 / 人员 / 机具并做冲突校验；
  * 消费 WorkOrder、Fault 与 <StatBadge>。
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Alert,
@@ -42,6 +42,7 @@ import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
 import {
   clearFaultSelection,
+  clearResumeDraft,
   createWorkOrder,
   deleteWorkOrder,
   selectPlanableFaults,
@@ -53,6 +54,7 @@ import {
 import {
   MACHINE_LIBRARY,
   MEMBER_LIBRARY,
+  RESUME_MODE_LABEL,
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
   buildWorkOrderCode,
@@ -60,7 +62,7 @@ import {
 } from '../types/workOrder';
 import { FAULT_SEVERITY_LABEL, type FaultSeverity } from '../types/fault';
 import { ROUTES } from '../router/routes';
-import { endTimeOf, findMachineConflicts, findMemberConflicts, formatDuration, nowDateTime, windowMinutes } from '../utils/window';
+import { endTimeOf, findMachineConflicts, findMemberConflicts, formatDuration, holdsResources, nowDateTime, windowMinutes } from '../utils/window';
 import { share } from '../utils/format';
 import { SEVERITY_HEX } from '../utils/severity';
 import StatBadge from '../components/common/StatBadge';
@@ -97,6 +99,7 @@ export default function WorkOrderPlan() {
   const planable = useAppSelector(selectPlanableFaults);
   const stats = useAppSelector(selectWindowStats);
   const allOrderRows = useAppSelector((state) => state.workOrder.workOrders);
+  const resumeDraft = useAppSelector((state) => state.workOrder.resumeDraft);
 
   const [toast, setToast] = useState('');
   const [selectedFaults, setSelectedFaults] = useState<string[]>([]);
@@ -106,10 +109,28 @@ export default function WorkOrderPlan() {
     form: defaultForm(),
   });
 
-  /** 当前表单的冲突预检结果 */
+  /** 暂停单恢复：草稿到达编排台后自动开单，仅携带剩余病害 */
+  useEffect(() => {
+    if (!resumeDraft) return;
+    setDialog({
+      open: true,
+      editingId: null,
+      form: {
+        code: buildWorkOrderCode(new Date(), Math.floor(Math.random() * 90) + 10),
+        windowStart: resumeDraft.windowStart,
+        windowEnd: resumeDraft.windowEnd,
+        leader: resumeDraft.leader,
+        machines: resumeDraft.machines,
+        members: resumeDraft.members,
+        faultIds: resumeDraft.faultIds,
+      },
+    });
+  }, [resumeDraft]);
+
+  /** 当前表单的冲突预检结果（已暂停 / 已完成的单已释放资源，不参与占用校验） */
   const draftConflicts = useMemo(() => {
     const others = allOrderRows
-      .filter((item) => item.id !== dialog.editingId)
+      .filter((item) => item.id !== dialog.editingId && holdsResources(item.state))
       .map((item) => ({
         id: item.id,
         code: item.code,
@@ -166,6 +187,12 @@ export default function WorkOrderPlan() {
     });
   };
 
+  /** 关闭表单：未保存的恢复草稿一并作废 */
+  const closeDialog = (): void => {
+    setDialog((prev) => ({ ...prev, open: false, editingId: null }));
+    if (resumeDraft) dispatch(clearResumeDraft());
+  };
+
   const submit = async (): Promise<void> => {
     if (!dialog.form.leader.trim()) {
       setToast('请选择负责人');
@@ -184,11 +211,16 @@ export default function WorkOrderPlan() {
       setToast('作业单已更新');
     } else {
       try {
-        const result = await dispatch(createWorkOrder(dialog.form)).unwrap();
+        const result = await dispatch(
+          createWorkOrder({ ...dialog.form, resumeFromOrderId: resumeDraft?.sourceOrderId }),
+        ).unwrap();
+        const resumed = resumeDraft
+          ? `；剩余病害 ${resumeDraft.faultIds.length} 处已从暂停单 ${resumeDraft.sourceCode} 摘出`
+          : '';
         setToast(
           result.conflicts.length > 0
-            ? `作业单已创建，但与 ${result.conflicts.join('、')} 时间窗重叠，请复核`
-            : '作业单已创建',
+            ? `作业单已创建，但与 ${result.conflicts.join('、')} 时间窗重叠，请复核${resumed}`
+            : `作业单已创建${resumed}`,
         );
       } catch (error) {
         setToast(`建单失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -222,7 +254,7 @@ export default function WorkOrderPlan() {
 
       <Grid container spacing={1.5} mb={1.75}>
         <Grid item xs={12} sm={6} md={3}>
-          <StatBadge title="作业单总数" value={stats.total} suffix="张" color="#1565c0" />
+          <StatBadge title="作业单总数" value={stats.total} suffix="张" color="#1565c0" hint={`已暂停 ${stats.pausedCount} 张（已释放资源）`} />
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
           <StatBadge
@@ -360,7 +392,7 @@ export default function WorkOrderPlan() {
                         <Typography variant="subtitle2" fontWeight={600}>
                           {order.code}
                         </Typography>
-                        <Chip size="small" label={WORK_ORDER_STATE_LABEL[order.state]} color={order.state === 'done' ? 'success' : 'default'} />
+                        <Chip size="small" label={WORK_ORDER_STATE_LABEL[order.state]} color={order.state === 'done' ? 'success' : order.state === 'paused' ? 'warning' : 'default'} />
                         {order.conflict ? (
                           <Tooltip title={`与 ${order.conflictCodes.join('、')} 时间窗重叠`}>
                             <Chip size="small" color="error" icon={<WarningAmberIcon />} label="时间窗冲突" />
@@ -408,6 +440,11 @@ export default function WorkOrderPlan() {
                       ))}
                       {order.faultLabels.length > 4 ? <Chip size="small" label={`+${order.faultLabels.length - 4}`} /> : null}
                     </Stack>
+                    {order.state === 'paused' ? (
+                      <Typography variant="caption" color="warning.dark" display="block" mt={0.5}>
+                        已暂停：{order.pauseReason ?? '—'}（{order.pausedAt ?? '—'}）· 人员机具已释放，可在进度页恢复
+                      </Typography>
+                    ) : null}
                     {WORK_ORDER_STATE_FLOW[order.state].length > 0 ? (
                       <Typography variant="caption" color="text.secondary" display="block" mt={0.5}>
                         下一步可推进为：{WORK_ORDER_STATE_FLOW[order.state].map((item) => WORK_ORDER_STATE_LABEL[item]).join('、')}
@@ -422,10 +459,18 @@ export default function WorkOrderPlan() {
       </Grid>
 
       {/* 作业单表单 */}
-      <Dialog open={dialog.open} onClose={() => setDialog((prev) => ({ ...prev, open: false }))} fullWidth maxWidth="md">
+      <Dialog open={dialog.open} onClose={closeDialog} fullWidth maxWidth="md">
         <DialogTitle>{dialog.editingId ? '编辑天窗作业单' : '新建天窗作业单'}</DialogTitle>
         <DialogContent dividers>
           <Grid container spacing={2} mt={0.5}>
+            {resumeDraft && !dialog.editingId ? (
+              <Grid item xs={12}>
+                <Alert severity="warning">
+                  恢复自暂停单 {resumeDraft.sourceCode}（{RESUME_MODE_LABEL[resumeDraft.mode]}）：仅携带剩余病害{' '}
+                  {resumeDraft.faultIds.length} 处，保存后这些病害将从原暂停单摘出，原单留作已处理记录。
+                </Alert>
+              </Grid>
+            ) : null}
             <Grid item xs={12} md={4}>
               <TextField
                 fullWidth
@@ -626,7 +671,7 @@ export default function WorkOrderPlan() {
           </Grid>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setDialog((prev) => ({ ...prev, open: false }))}>取消</Button>
+          <Button onClick={closeDialog}>取消</Button>
           <Button variant="contained" onClick={() => void submit()}>
             保存
           </Button>

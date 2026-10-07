@@ -1,6 +1,8 @@
 /**
  * /progress 作业进度与销号回写
  * 按天窗批次更新作业状态，完成项自动回写病害销号；
+ * 作业中可登记暂停（原因 + 时间 + 已处理病害销号，随后释放人员机具），
+ * 已暂停单恢复时人员机具二选一，只带剩余病害生成草稿；
  * 消费 WorkOrder、Fault、Inspection 与 <FilterBar>。
  */
 import { useMemo, useState } from 'react';
@@ -9,10 +11,18 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   Chip,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  FormControlLabel,
   Grid,
   LinearProgress,
   Paper,
+  Radio,
+  RadioGroup,
   Snackbar,
   Stack,
   Table,
@@ -21,31 +31,60 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  TextField,
   Tooltip,
   Typography,
 } from '@mui/material';
 import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import PauseIcon from '@mui/icons-material/Pause';
+import ReplayIcon from '@mui/icons-material/Replay';
 import CheckCircleIcon from '@mui/icons-material/CheckCircle';
 import AssignmentTurnedInIcon from '@mui/icons-material/AssignmentTurnedIn';
 import DownloadIcon from '@mui/icons-material/Download';
 import { useAppDispatch, useAppSelector } from '../hooks/useAppStore';
-import { advanceWorkOrder, selectWindowStats, selectWorkOrderViews } from '../stores/workOrderStore';
+import {
+  advanceWorkOrder,
+  pauseWorkOrder,
+  pickFreeResources,
+  prepareResumeDraft,
+  selectWindowStats,
+  selectWorkOrderViews,
+} from '../stores/workOrderStore';
 import { selectFaultViews } from '../stores/faultStore';
 import {
+  MACHINE_LIBRARY,
+  MEMBER_LIBRARY,
+  RESUME_MODE_LABEL,
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
+  pauseBlockReason,
+  resumeBlockReason,
+  type ResumeMode,
   type WorkOrderState,
+  type WorkOrderView,
 } from '../types/workOrder';
-import { FAULT_SEVERITY_LABEL } from '../types/fault';
+import { FAULT_PART_LABEL, FAULT_SEVERITY_LABEL, FAULT_TYPE_LABEL } from '../types/fault';
 import { ROUTES } from '../router/routes';
-import { formatDuration, nowDateTime } from '../utils/window';
+import { endTimeOf, formatDuration, nowDateTime, occupiedResources } from '../utils/window';
 import { downloadCsv, share } from '../utils/format';
 import { SEVERITY_HEX } from '../utils/severity';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
 
-const STATE_ORDER: WorkOrderState[] = ['planned', 'issued', 'working', 'done'];
+const STATE_ORDER: WorkOrderState[] = ['planned', 'issued', 'working', 'paused', 'done'];
+
+interface PauseDialogState {
+  order: WorkOrderView;
+  reason: string;
+  pausedAt: string;
+  solvedIds: string[];
+}
+
+interface ResumeDialogState {
+  order: WorkOrderView;
+  mode: ResumeMode;
+}
 
 export default function ProgressView() {
   const dispatch = useAppDispatch();
@@ -53,10 +92,13 @@ export default function ProgressView() {
   const orders = useAppSelector(selectWorkOrderViews);
   const faults = useAppSelector(selectFaultViews);
   const stats = useAppSelector(selectWindowStats);
+  const rawOrders = useAppSelector((state) => state.workOrder.workOrders);
 
   const keyword = useKeywordFilter();
   const filters = useFilterValues(['state', 'yard']);
   const [toast, setToast] = useState('');
+  const [pauseDialog, setPauseDialog] = useState<PauseDialogState | null>(null);
+  const [resumeDialog, setResumeDialog] = useState<ResumeDialogState | null>(null);
 
   const rows = useMemo(() => {
     const lower = keyword.trim().toLowerCase();
@@ -83,6 +125,7 @@ export default function ProgressView() {
     const working = orders.filter((item) => item.state === 'working').length;
     const issued = orders.filter((item) => item.state === 'issued').length;
     const planned = orders.filter((item) => item.state === 'planned').length;
+    const paused = orders.filter((item) => item.state === 'paused').length;
     const pendingFaults = faults.filter((item) => item.state === 'pending').length;
     const solvedFaults = faults.filter((item) => item.state === 'solved').length;
     return {
@@ -90,12 +133,46 @@ export default function ProgressView() {
       working,
       issued,
       planned,
+      paused,
       pendingFaults,
       solvedFaults,
       completion: orders.length === 0 ? 0 : Number(((done / orders.length) * 100).toFixed(1)),
       solveRate: faults.length === 0 ? 0 : Number(((solvedFaults / faults.length) * 100).toFixed(1)),
     };
   }, [orders, faults]);
+
+  /** 暂停对话框内：该单仍可销号的待修病害 */
+  const pausePendingFaults = useMemo(() => {
+    if (!pauseDialog) return [];
+    return faults.filter((item) => pauseDialog.order.faultIds.includes(item.id) && item.state === 'pending');
+  }, [pauseDialog, faults]);
+
+  /** 恢复对话框内：按当前窗口重查占用，预览两种模式的取舍结果 */
+  const resumePreview = useMemo(() => {
+    if (!resumeDialog) return null;
+    const order = resumeDialog.order;
+    const start = nowDateTime();
+    const end = endTimeOf(start, order.durationMinutes || 120);
+    const occupied = occupiedResources(
+      { id: order.id, windowStart: start, windowEnd: end },
+      rawOrders.map((item) => ({
+        id: item.id,
+        code: item.code,
+        state: item.state,
+        windowStart: item.windowStart,
+        windowEnd: item.windowEnd,
+        members: item.members,
+        machines: item.machines,
+      })),
+    );
+    return {
+      occupied,
+      recheckMembers: pickFreeResources(order.members, MEMBER_LIBRARY, occupied.members),
+      recheckMachines: pickFreeResources(order.machines, MACHINE_LIBRARY, occupied.machines),
+      busyMembers: order.members.filter((name) => occupied.members.includes(name)),
+      busyMachines: order.machines.filter((name) => occupied.machines.includes(name)),
+    };
+  }, [resumeDialog, rawOrders]);
 
   const advance = async (id: string, next: WorkOrderState, code: string): Promise<void> => {
     try {
@@ -110,8 +187,44 @@ export default function ProgressView() {
     }
   };
 
+  const confirmPause = async (): Promise<void> => {
+    if (!pauseDialog) return;
+    try {
+      const result = await dispatch(
+        pauseWorkOrder({
+          id: pauseDialog.order.id,
+          reason: pauseDialog.reason,
+          pausedAt: pauseDialog.pausedAt,
+          solvedFaultIds: pauseDialog.solvedIds,
+        }),
+      ).unwrap();
+      setToast(
+        `${pauseDialog.order.code} 已暂停：销掉已处理病害 ${result.solvedCount} 处，人员机具已释放`,
+      );
+      setPauseDialog(null);
+    } catch (error) {
+      setToast(`暂停失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  };
+
+  const confirmResume = async (): Promise<void> => {
+    if (!resumeDialog) return;
+    try {
+      const draft = await dispatch(
+        prepareResumeDraft({ id: resumeDialog.order.id, mode: resumeDialog.mode }),
+      ).unwrap();
+      setToast(
+        `已按「${RESUME_MODE_LABEL[resumeDialog.mode]}」生成恢复草稿：剩余病害 ${draft.faultIds.length} 处，请在编排台确认成单`,
+      );
+      setResumeDialog(null);
+      navigate(ROUTES.workorders);
+    } catch (error) {
+      setToast(`恢复失败：${error instanceof Error ? error.message : '未知错误'}`);
+    }
+  };
+
   const exportCsv = (): void => {
-    const header = ['作业单', '状态', '天窗起', '天窗止', '时长(分钟)', '负责人', '作业人员', '机具', '关联病害', '待销号', '冲突'];
+    const header = ['作业单', '状态', '天窗起', '天窗止', '时长(分钟)', '负责人', '作业人员', '机具', '关联病害', '待销号', '暂停原因', '暂停时间', '冲突'];
     const body = rows.map((order) => [
       order.code,
       WORK_ORDER_STATE_LABEL[order.state],
@@ -123,6 +236,8 @@ export default function ProgressView() {
       order.machines.join(' '),
       order.faultIds.length,
       order.pendingFaultCount,
+      order.pauseReason ?? '',
+      order.pausedAt ?? '',
       order.conflict ? order.conflictCodes.join(' ') : '无',
     ]);
     downloadCsv(`gbrailswitch-progress-${nowDateTime().slice(0, 10)}.csv`, [header, ...body]);
@@ -140,6 +255,7 @@ export default function ProgressView() {
           </Typography>
           <Typography variant="body2" color="text.secondary">
             按天窗批次推进状态：待编排 → 已下达 → 作业中 → 已完成；推进到已完成时自动回写关联病害销号。
+            中途遇故障可登记暂停，销掉已处理病害后释放人员机具，恢复时只带剩余病害生成新草稿。
           </Typography>
         </Box>
         <Stack direction="row" spacing={1}>
@@ -169,7 +285,7 @@ export default function ProgressView() {
             value={overview.working + overview.issued}
             suffix="张"
             color="#1565c0"
-            hint={`已下达 ${overview.issued} · 作业中 ${overview.working} · 待编排 ${overview.planned}`}
+            hint={`已下达 ${overview.issued} · 作业中 ${overview.working} · 已暂停 ${overview.paused} · 待编排 ${overview.planned}`}
           />
         </Grid>
         <Grid item xs={12} sm={6} md={3}>
@@ -188,7 +304,7 @@ export default function ProgressView() {
             value={stats.minutes}
             suffix="分钟"
             color="#ed6c02"
-            hint={`占用率 ${stats.occupationRate}%（基准 180 分钟/日）`}
+            hint={`占用率 ${stats.occupationRate}%（基准 180 分钟/日，已暂停单不计）`}
           />
         </Grid>
       </Grid>
@@ -227,10 +343,23 @@ export default function ProgressView() {
         ) : (
           <Stack spacing={1.5}>
             {rows.map((order) => {
+              const totalFaults = order.faultIds.length;
+              const handledPercent =
+                totalFaults === 0 ? 0 : Math.round((order.solvedFaultCount / totalFaults) * 100);
               const progressPercent =
-                order.state === 'done' ? 100 : order.state === 'working' ? 60 : order.state === 'issued' ? 30 : 10;
+                order.state === 'done'
+                  ? 100
+                  : order.state === 'paused'
+                    ? handledPercent
+                    : order.state === 'working'
+                      ? 60
+                      : order.state === 'issued'
+                        ? 30
+                        : 10;
               const nextStates = WORK_ORDER_STATE_FLOW[order.state];
               const relatedFaults = faults.filter((item) => order.faultIds.includes(item.id));
+              const pauseBlocked = pauseBlockReason(order.state, order.pendingFaultCount);
+              const resumeBlocked = resumeBlockReason(order.state, order.pendingFaultCount);
               return (
                 <Paper key={order.id} variant="outlined" sx={{ borderRadius: 2, p: 1.75 }}>
                   <Stack direction="row" justifyContent="space-between" alignItems="flex-start" flexWrap="wrap" useFlexGap>
@@ -241,7 +370,15 @@ export default function ProgressView() {
                         </Typography>
                         <Chip
                           size="small"
-                          color={order.state === 'done' ? 'success' : order.state === 'working' ? 'info' : 'default'}
+                          color={
+                            order.state === 'done'
+                              ? 'success'
+                              : order.state === 'working'
+                                ? 'info'
+                                : order.state === 'paused'
+                                  ? 'warning'
+                                  : 'default'
+                          }
                           label={WORK_ORDER_STATE_LABEL[order.state]}
                         />
                         {order.conflict ? (
@@ -269,22 +406,68 @@ export default function ProgressView() {
                           推进为{WORK_ORDER_STATE_LABEL[next]}
                         </Button>
                       ))}
+                      {order.state !== 'done' && order.state !== 'paused' ? (
+                        <Tooltip
+                          title={pauseBlocked ?? '登记暂停原因与时间，销掉已处理病害后释放人员机具'}
+                        >
+                          <span>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              color="warning"
+                              startIcon={<PauseIcon />}
+                              disabled={pauseBlocked !== null}
+                              onClick={() =>
+                                setPauseDialog({ order, reason: '', pausedAt: nowDateTime(), solvedIds: [] })
+                              }
+                            >
+                              暂停
+                            </Button>
+                          </span>
+                        </Tooltip>
+                      ) : null}
+                      {order.state === 'paused' ? (
+                        <Tooltip title={resumeBlocked ?? '人员机具二选一，只带剩余病害生成恢复草稿'}>
+                          <span>
+                            <Button
+                              size="small"
+                              variant="contained"
+                              color="warning"
+                              startIcon={<ReplayIcon />}
+                              disabled={resumeBlocked !== null}
+                              onClick={() => setResumeDialog({ order, mode: 'recheck' })}
+                            >
+                              恢复
+                            </Button>
+                          </span>
+                        </Tooltip>
+                      ) : null}
                       {order.state === 'done' ? (
                         <Chip icon={<CheckCircleIcon />} color="success" label="已完成并回写销号" />
                       ) : null}
                     </Stack>
                   </Stack>
 
+                  {order.state === 'paused' ? (
+                    <Alert severity="warning" icon={<PauseIcon />} sx={{ mt: 1 }}>
+                      暂停原因：{order.pauseReason ?? '—'} · 暂停于 {order.pausedAt ?? '—'} · 处理进度：已销号{' '}
+                      {order.solvedFaultCount}/{totalFaults} 处 · 人员机具已释放，剩余 {order.pendingFaultCount}{' '}
+                      处病害待恢复编排
+                    </Alert>
+                  ) : null}
+
                   <Box mt={1.25}>
                     <LinearProgress
                       variant="determinate"
                       value={progressPercent}
                       sx={{ height: 8, borderRadius: 4 }}
-                      color={order.state === 'done' ? 'success' : 'primary'}
+                      color={order.state === 'done' ? 'success' : order.state === 'paused' ? 'warning' : 'primary'}
                     />
                     <Typography variant="caption" color="text.secondary">
-                      进度 {progressPercent}% · 关联病害 {order.faultIds.length} 处（待销号 {order.pendingFaultCount}）· 作业人员{' '}
-                      {order.members.join('、')} · 机具 {order.machines.join('、')}
+                      {order.state === 'paused'
+                        ? `处理进度 ${progressPercent}%（已销号 ${order.solvedFaultCount}/${totalFaults} 处）`
+                        : `进度 ${progressPercent}% · 关联病害 ${totalFaults} 处（待销号 ${order.pendingFaultCount}）`}
+                      {' '}· 作业人员 {order.members.join('、')} · 机具 {order.machines.join('、')}
                     </Typography>
                   </Box>
 
@@ -350,8 +533,153 @@ export default function ProgressView() {
         )}
       </Box>
 
+      {/* 登记暂停 */}
+      <Dialog open={pauseDialog !== null} onClose={() => setPauseDialog(null)} fullWidth maxWidth="sm">
+        <DialogTitle>登记暂停 — {pauseDialog?.order.code}</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2} mt={0.5}>
+            <TextField
+              label="暂停原因"
+              required
+              multiline
+              minRows={2}
+              value={pauseDialog?.reason ?? ''}
+              onChange={(event) =>
+                setPauseDialog((prev) => (prev ? { ...prev, reason: event.target.value } : prev))
+              }
+              placeholder="如：机具故障、天气突变、临时接车"
+            />
+            <TextField
+              label="暂停时间"
+              type="datetime-local"
+              size="small"
+              InputLabelProps={{ shrink: true }}
+              value={(pauseDialog?.pausedAt ?? '').replace(' ', 'T')}
+              onChange={(event) =>
+                setPauseDialog((prev) =>
+                  prev ? { ...prev, pausedAt: event.target.value.replace('T', ' ') } : prev,
+                )
+              }
+            />
+            <Box>
+              <Typography variant="subtitle2" gutterBottom>
+                已处理病害（勾选后随暂停销号）
+              </Typography>
+              {pausePendingFaults.length === 0 ? (
+                <Typography variant="caption" color="text.secondary">
+                  该单暂无待销号病害
+                </Typography>
+              ) : (
+                pausePendingFaults.map((fault) => (
+                  <Stack key={fault.id} direction="row" alignItems="center" spacing={0.5}>
+                    <Checkbox
+                      size="small"
+                      checked={pauseDialog?.solvedIds.includes(fault.id) ?? false}
+                      onChange={() =>
+                        setPauseDialog((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                solvedIds: prev.solvedIds.includes(fault.id)
+                                  ? prev.solvedIds.filter((id) => id !== fault.id)
+                                  : [...prev.solvedIds, fault.id],
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                    <Typography variant="body2" sx={{ flexGrow: 1 }}>
+                      {fault.yardName} · {fault.switchCode} · {FAULT_PART_LABEL[fault.part]} /{' '}
+                      {FAULT_TYPE_LABEL[fault.type]}
+                    </Typography>
+                    <Chip
+                      size="small"
+                      label={FAULT_SEVERITY_LABEL[fault.severity]}
+                      sx={{
+                        backgroundColor: `${SEVERITY_HEX[fault.severity]}1a`,
+                        color: SEVERITY_HEX[fault.severity],
+                      }}
+                    />
+                  </Stack>
+                ))
+              )}
+            </Box>
+            <Alert severity="info">
+              确认后：勾选病害按暂停时间销号，人员机具立即释放（不再参与占用校验），剩余病害待恢复时重新编排。
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setPauseDialog(null)}>取消</Button>
+          <Button
+            variant="contained"
+            color="warning"
+            disabled={!pauseDialog?.reason.trim()}
+            onClick={() => void confirmPause()}
+          >
+            确认暂停
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 恢复作业：人员机具二选一 */}
+      <Dialog open={resumeDialog !== null} onClose={() => setResumeDialog(null)} fullWidth maxWidth="sm">
+        <DialogTitle>恢复作业 — {resumeDialog?.order.code}</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2} mt={0.5}>
+            <Alert severity="info">
+              恢复后只带剩余病害生成草稿：剩余 {resumeDialog?.order.pendingFaultCount ?? 0} 处（已处理{' '}
+              {resumeDialog?.order.solvedFaultCount ?? 0} 处留在原暂停单作记录）。
+            </Alert>
+            <RadioGroup
+              value={resumeDialog?.mode ?? 'recheck'}
+              onChange={(event) =>
+                setResumeDialog((prev) =>
+                  prev ? { ...prev, mode: event.target.value as ResumeMode } : prev,
+                )
+              }
+            >
+              <FormControlLabel value="recheck" control={<Radio />} label={RESUME_MODE_LABEL.recheck} />
+              <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
+                重新查询当前空闲的人员机具，已被别的单占用的按字典顺序替换补齐
+              </Typography>
+              <FormControlLabel value="reuse" control={<Radio />} label={RESUME_MODE_LABEL.reuse} />
+              <Typography variant="caption" color="text.secondary" sx={{ ml: 4, mt: -1 }}>
+                保留暂停前的人员机具；若沿用旧安排，会把已被别的单占用的资源当成可用
+              </Typography>
+            </RadioGroup>
+            {resumeDialog?.mode === 'recheck' && resumePreview ? (
+              <Alert severity="success">
+                重查结果：人员 {resumePreview.recheckMembers.join('、') || '—'} · 机具{' '}
+                {resumePreview.recheckMachines.join('、') || '—'}
+                {resumePreview.occupied.orderCodes.length > 0
+                  ? `（已剔除被 ${resumePreview.occupied.orderCodes.join('、')} 占用的资源）`
+                  : '（当前时间窗无占用冲突）'}
+              </Alert>
+            ) : null}
+            {resumeDialog?.mode === 'reuse' && resumePreview ? (
+              resumePreview.busyMembers.length > 0 || resumePreview.busyMachines.length > 0 ? (
+                <Alert severity="warning">
+                  以下资源当前已被 {resumePreview.occupied.orderCodes.join('、')} 占用，沿用将产生占用冲突：人员{' '}
+                  {resumePreview.busyMembers.join('、') || '无'} · 机具 {resumePreview.busyMachines.join('、') || '无'}
+                </Alert>
+              ) : (
+                <Alert severity="success">旧安排的人员机具当前均空闲，可直接沿用。</Alert>
+              )
+            ) : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setResumeDialog(null)}>取消</Button>
+          <Button variant="contained" color="warning" onClick={() => void confirmResume()}>
+            生成恢复草稿
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <Alert severity="info" sx={{ mt: 2 }}>
-        说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间，
+        说明：天窗作业单推进到「已完成」时，系统会把该单关联的全部待修病害一次性置为已销号并记录销号时间；
+        中途遇故障可「暂停」——登记原因与时间、销掉已处理病害并释放人员机具，恢复时只带剩余病害生成新草稿，
         可在「病害评定与销号」页撤销销号。
       </Alert>
 

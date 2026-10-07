@@ -28,6 +28,8 @@ docker compose up -d --build # 代码改动后重建
 - 评定病害等级（轻 / 中 / 重）、批量调整、批量升级、手工销号与撤销
 - 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具，并做**时间窗 + 人员 + 机具三重冲突校验**
 - 按天窗批次推进状态（待编排 → 已下达 → 作业中 → 已完成），推进到已完成时**自动回写病害销号**
+- 作业中途遇故障可**登记暂停**：记录原因与时间、销掉已处理病害并**释放人员机具**（不再参与占用校验）；已完成、未下达或无剩余病害的单不能暂停
+- 已暂停单**恢复**时人员机具二选一（按当前空闲重查 / 沿用旧安排，沿用会提示已被别的单占用的资源），只带剩余病害生成新草稿，保存后剩余病害从原暂停单摘出
 - 登记慢行 / 封锁条件，查看结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -53,7 +55,7 @@ docker compose up -d --build # 代码改动后重建
 | `/inspections` | 巡检与病害录入 | 按巡检批次录入病害并定位到部件 |
 | `/faults` | 病害评定与销号 | 评定等级、批量调整、手工销号与撤销 |
 | `/workorders` | 天窗作业单编排 | 勾选病害成单、分配时间窗与人员机具并校验冲突 |
-| `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号 |
+| `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号；登记暂停（原因 + 时间 + 已处理病害销号）与恢复（人员机具二选一，只带剩余病害生成草稿） |
 | `/backup` | 封锁条件与版本 | 登记慢行 / 封锁条件，结构版本与 JSON 管理 |
 
 > 路由使用 `createBrowserRouter`（History 模式），真实路径 `/yards`、`/workorders` 等可直接访问，
@@ -93,7 +95,7 @@ sologsb101-1004/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2 → v3 的 `upgrade` 迁移（v2：补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表；v3：作业单新增暂停登记字段 `pauseReason` / `pausedAt`，存量单补 `null`）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -106,7 +108,7 @@ sologsb101-1004/
   | `restrictions` | 封锁 / 慢行条件 | id / yardId / switchCode |
   | `settings` | 自定义字典 | id |
 
-- **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 3 张天窗作业单（含 1 张刻意与人员时间窗冲突）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
+- **首屏自动播种**：`initDatabase()` 在 `yards` 表为空时写入演示数据（幂等）——2 个站场 × 各 4 组道岔 × 1~2 次巡检 × 每次 0~3 条病害 + 4 张天窗作业单（含 1 张作业中、1 张刻意与人员时间窗冲突、1 张已暂停且部分病害已销号）+ 2 条封锁条件，父子记录通过 `yardId / switchId / inspectionId / faultIds` 互相引用。
 - **跨页状态**：全部放在 Redux Toolkit store（`yardStore / switchStore / faultStore / workOrderStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，store 自动重新拉取。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
 

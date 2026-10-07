@@ -1,6 +1,8 @@
 /**
  * 天窗作业单状态（Redux Toolkit slice）
  * 维护作业单编排、时间窗冲突校验、人员机具占用校验与进度推进（完成回写销号）。
+ * 暂停 / 恢复：作业中登记暂停原因与时间并销掉已处理病害、释放人员机具；
+ * 恢复时人员机具二选一（按当前空闲重查 / 沿用旧安排），只带剩余病害生成草稿。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
 import {
@@ -20,17 +22,26 @@ import {
   type YardRow,
 } from '../utils/db';
 import {
+  MACHINE_LIBRARY,
+  MEMBER_LIBRARY,
   WORK_ORDER_STATE_FLOW,
   buildWorkOrderCode,
+  pauseBlockReason,
+  resumeBlockReason,
+  type ResumeDraft,
+  type ResumeMode,
   type WorkOrderDraft,
   type WorkOrderState,
   type WorkOrderView,
 } from '../types/workOrder';
 import {
+  endTimeOf,
   findConflicts,
   findMachineConflicts,
   findMemberConflicts,
+  holdsResources,
   nowDateTime,
+  occupiedResources,
   windowMinutes,
 } from '../utils/window';
 import { emitChange } from '../utils/events';
@@ -43,6 +54,8 @@ export interface WorkOrderStateSlice {
   yards: YardRow[];
   /** 编排时勾选的病害 */
   selectedFaultIds: string[];
+  /** 暂停单恢复时生成的草稿（跨页传递到编排台） */
+  resumeDraft: ResumeDraft | null;
   loading: boolean;
   error: string;
 }
@@ -54,6 +67,7 @@ const initialState: WorkOrderStateSlice = {
   switches: [],
   yards: [],
   selectedFaultIds: [],
+  resumeDraft: null,
   loading: false,
   error: '',
 };
@@ -86,19 +100,21 @@ export const loadWorkOrderData = createAsyncThunk<
 /** 新建作业单：把勾选病害编排进同一时间窗，并回传时间窗冲突编号 */
 export const createWorkOrder = createAsyncThunk<
   { created: boolean; conflicts: string[] },
-  WorkOrderDraft,
+  WorkOrderDraft & { resumeFromOrderId?: string },
   { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
 >('workOrder/create', async (draft, { getState, rejectWithValue }) => {
   try {
     const state = getState().workOrder;
     const conflicts = findConflicts(
       { id: 'pending', windowStart: draft.windowStart, windowEnd: draft.windowEnd },
-      state.workOrders.map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-      })),
+      state.workOrders
+        .filter((item) => holdsResources(item.state))
+        .map((item) => ({
+          id: item.id,
+          code: item.code,
+          windowStart: item.windowStart,
+          windowEnd: item.windowEnd,
+        })),
     ).map((item) => item.code);
 
     await putWorkOrder({
@@ -111,10 +127,21 @@ export const createWorkOrder = createAsyncThunk<
       machines: draft.machines,
       members: draft.members,
       state: 'planned',
+      pauseReason: null,
+      pausedAt: null,
       createdAt: nowDateTime(),
       updatedAt: nowDateTime(),
       revision: ROW_REVISION,
     });
+    // 恢复草稿保存：剩余病害从来源暂停单摘出，暂停单只留已处理病害作记录
+    if (draft.resumeFromOrderId) {
+      const source = state.workOrders.find((item) => item.id === draft.resumeFromOrderId);
+      if (source) {
+        const remaining = source.faultIds.filter((faultId) => !draft.faultIds.includes(faultId));
+        if (remaining.length === 0) await removeWorkOrder(source.id);
+        else await putWorkOrder({ ...source, faultIds: remaining, updatedAt: nowDateTime() });
+      }
+    }
     emitChange();
     return { created: true, conflicts };
   } catch (error) {
@@ -200,6 +227,112 @@ export const deleteWorkOrder = createAsyncThunk<void, string, { rejectValue: str
   },
 );
 
+/**
+ * 登记暂停：记录原因与时间，把已处理病害销号，随后人员机具释放
+ * （已暂停单不再参与时间窗 / 人员 / 机具占用校验）。
+ * 已完成、未下达或无剩余病害的单不能暂停。
+ */
+export const pauseWorkOrder = createAsyncThunk<
+  { solvedCount: number },
+  { id: string; reason: string; pausedAt: string; solvedFaultIds: string[] },
+  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
+>('workOrder/pause', async ({ id, reason, pausedAt, solvedFaultIds }, { getState, rejectWithValue }) => {
+  try {
+    const state = getState().workOrder;
+    const existing = state.workOrders.find((item) => item.id === id);
+    if (!existing) return rejectWithValue('作业单不存在');
+    const pendingCount = state.faults.filter(
+      (item) => existing.faultIds.includes(item.id) && item.state === 'pending',
+    ).length;
+    const blocked = pauseBlockReason(existing.state, pendingCount);
+    if (blocked) return rejectWithValue(blocked);
+    if (!reason.trim()) return rejectWithValue('请登记暂停原因');
+
+    const handled = state.faults.filter(
+      (item) => solvedFaultIds.includes(item.id) && existing.faultIds.includes(item.id) && item.state === 'pending',
+    );
+    if (handled.length > 0) {
+      await putFaults(handled.map((item) => ({ ...item, state: 'solved' as const, solvedAt: pausedAt })));
+    }
+    await putWorkOrder({
+      ...existing,
+      state: 'paused',
+      pauseReason: reason.trim(),
+      pausedAt,
+      updatedAt: nowDateTime(),
+    });
+    emitChange();
+    return { solvedCount: handled.length };
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '登记暂停失败');
+  }
+});
+
+/** 从字典补空：保留当前仍空闲的旧安排，缺额按字典顺序用空闲资源补齐到原数量 */
+export function pickFreeResources(oldList: string[], library: string[], busy: string[]): string[] {
+  const kept = oldList.filter((name) => !busy.includes(name));
+  const fill = library.filter((name) => !busy.includes(name) && !kept.includes(name));
+  return [...kept, ...fill].slice(0, oldList.length);
+}
+
+/**
+ * 生成恢复草稿：只带剩余（未销号）病害。
+ * 人员机具二选一——「按当前空闲重查」剔除已被别的单占用的资源并按字典补齐；
+ * 「沿用旧安排」原样带出（占用风险由编排台冲突预检提示）。
+ */
+export const prepareResumeDraft = createAsyncThunk<
+  ResumeDraft,
+  { id: string; mode: ResumeMode },
+  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
+>('workOrder/prepareResume', async ({ id, mode }, { getState, rejectWithValue }) => {
+  try {
+    const state = getState().workOrder;
+    const existing = state.workOrders.find((item) => item.id === id);
+    if (!existing) return rejectWithValue('作业单不存在');
+    const remainingIds = existing.faultIds.filter((faultId) =>
+      state.faults.some((item) => item.id === faultId && item.state === 'pending'),
+    );
+    const blocked = resumeBlockReason(existing.state, remainingIds.length);
+    if (blocked) return rejectWithValue(blocked);
+
+    const duration = windowMinutes(existing) || 120;
+    const windowStart = nowDateTime();
+    const windowEnd = endTimeOf(windowStart, duration);
+
+    let members = existing.members;
+    let machines = existing.machines;
+    if (mode === 'recheck') {
+      const occupied = occupiedResources(
+        { id: existing.id, windowStart, windowEnd },
+        state.workOrders.map((item) => ({
+          id: item.id,
+          code: item.code,
+          state: item.state,
+          windowStart: item.windowStart,
+          windowEnd: item.windowEnd,
+          members: item.members,
+          machines: item.machines,
+        })),
+      );
+      members = pickFreeResources(existing.members, MEMBER_LIBRARY, occupied.members);
+      machines = pickFreeResources(existing.machines, MACHINE_LIBRARY, occupied.machines);
+    }
+    return {
+      sourceOrderId: existing.id,
+      sourceCode: existing.code,
+      mode,
+      faultIds: remainingIds,
+      windowStart,
+      windowEnd,
+      leader: existing.leader,
+      members,
+      machines,
+    };
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '生成恢复草稿失败');
+  }
+});
+
 const workOrderSlice = createSlice({
   name: 'workOrder',
   initialState,
@@ -215,6 +348,9 @@ const workOrderSlice = createSlice({
     },
     clearFaultSelection(state) {
       state.selectedFaultIds = [];
+    },
+    clearResumeDraft(state) {
+      state.resumeDraft = null;
     },
   },
   extraReducers: (builder) => {
@@ -232,15 +368,29 @@ const workOrderSlice = createSlice({
         state.yards = action.payload.yards;
         const validIds = new Set(action.payload.faults.map((item) => item.id));
         state.selectedFaultIds = state.selectedFaultIds.filter((id) => validIds.has(id));
+        // 来源暂停单被删除后，未保存的恢复草稿一并失效
+        if (
+          state.resumeDraft &&
+          !action.payload.workOrders.some((item) => item.id === state.resumeDraft?.sourceOrderId)
+        ) {
+          state.resumeDraft = null;
+        }
       })
       .addCase(loadWorkOrderData.rejected, (state, action) => {
         state.loading = false;
         state.error = action.payload ?? '作业单读取失败';
+      })
+      .addCase(createWorkOrder.fulfilled, (state) => {
+        state.resumeDraft = null;
+      })
+      .addCase(prepareResumeDraft.fulfilled, (state, action) => {
+        state.resumeDraft = action.payload;
       });
   },
 });
 
-export const { toggleFaultSelection, setFaultSelection, clearFaultSelection } = workOrderSlice.actions;
+export const { toggleFaultSelection, setFaultSelection, clearFaultSelection, clearResumeDraft } =
+  workOrderSlice.actions;
 export default workOrderSlice.reducer;
 
 interface RootLike {
@@ -269,7 +419,9 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
             .filter((name): name is string => Boolean(name)),
         ),
       ];
-      const others = workOrders.filter((item) => item.id !== order.id);
+      const others = holdsResources(order.state)
+        ? workOrders.filter((item) => item.id !== order.id && holdsResources(item.state))
+        : [];
       const conflictCodes = others
         .filter((item) => item.windowStart < order.windowEnd && order.windowStart < item.windowEnd)
         .map((item) => item.code);
@@ -303,6 +455,7 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         memberConflict: memberConflicts.length > 0,
         machineConflict: machineConflicts.length > 0,
         pendingFaultCount: related.filter((item) => item.state === 'pending').length,
+        solvedFaultCount: related.filter((item) => item.state === 'solved').length,
       };
     })
     .sort((a, b) => a.windowStart.localeCompare(b.windowStart));
@@ -328,21 +481,25 @@ export function selectPlanableFaults(state: {
     });
 }
 
-/** 天窗占用统计 */
+/** 天窗占用统计（已暂停 / 已完成的单已释放资源，不计入占用时长） */
 export function selectWindowStats(state: RootLike): {
   total: number;
   minutes: number;
   occupationRate: number;
   conflictCount: number;
   doneCount: number;
+  pausedCount: number;
 } {
   const views = selectWorkOrderViews(state);
-  const minutes = views.reduce((sum, item) => sum + item.durationMinutes, 0);
+  const minutes = views
+    .filter((item) => holdsResources(item.state))
+    .reduce((sum, item) => sum + item.durationMinutes, 0);
   return {
     total: views.length,
     minutes,
     occupationRate: Number(((minutes / 180) * 100).toFixed(1)),
     conflictCount: views.filter((item) => item.conflict).length,
     doneCount: views.filter((item) => item.state === 'done').length,
+    pausedCount: views.filter((item) => item.state === 'paused').length,
   };
 }
