@@ -19,7 +19,7 @@ import { nowIso, uuid } from './format';
 export const DB_NAME = 'gbrailswitch';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -111,6 +111,27 @@ class RailSwitchDatabase extends Dexie {
           }
           if (!Array.isArray(row.members)) row.members = [];
           if (!Array.isArray(row.machines)) row.machines = [];
+        });
+      });
+
+    // v3：作业单支持中途暂停 / 恢复——新增暂停原因、暂停时间、已处理病害与暂停时人员机具快照字段
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        yards: 'id, name, region, mileage',
+        switches: 'id, yardId, code, frogNumber, railType, [yardId+code]',
+        inspections: 'id, switchId, date, inspector, [switchId+date]',
+        faults: 'id, inspectionId, part, severity, state, [inspectionId+part]',
+        workOrders: 'id, code, state, windowStart, leader',
+        restrictions: 'id, yardId, switchCode',
+        settings: 'id',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('workOrders').toCollection().modify((row: Record<string, unknown>) => {
+          if (row.pausedReason === undefined) row.pausedReason = null;
+          if (row.pausedAt === undefined) row.pausedAt = null;
+          if (!Array.isArray(row.processedFaultIds)) row.processedFaultIds = [];
+          if (!Array.isArray(row.pausedMembers)) row.pausedMembers = [];
+          if (!Array.isArray(row.pausedMachines)) row.pausedMachines = [];
         });
       });
   }
@@ -305,6 +326,11 @@ async function seedDatabase(): Promise<void> {
       machines: index === 0 ? ['轨距尺', '钢轨打磨机', '扭矩扳手'] : ['道尺', '捣固镐'],
       members: index === 0 ? ['赵铁军', '孙立波'] : index === 1 ? ['孙立波', '郑小勇'] : ['周振海', '冯国栋'],
       state: group.state,
+      pausedReason: null,
+      pausedAt: null,
+      processedFaultIds: [],
+      pausedMembers: [],
+      pausedMachines: [],
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -502,7 +528,16 @@ export async function removeFault(id: string): Promise<void> {
 
 export async function listWorkOrders(): Promise<WorkOrderRow[]> {
   const rows = await db.workOrders.toArray();
-  return rows.sort((a, b) => a.windowStart.localeCompare(b.windowStart));
+  // 兼容 v2 及导入的旧快照缺失暂停 / 恢复字段（v3 索引未变时 Dexie 不跑 upgrade）
+  const normalized = rows.map((row) => ({
+    ...row,
+    pausedReason: row.pausedReason ?? null,
+    pausedAt: row.pausedAt ?? null,
+    processedFaultIds: Array.isArray(row.processedFaultIds) ? row.processedFaultIds : [],
+    pausedMembers: Array.isArray(row.pausedMembers) ? row.pausedMembers : [],
+    pausedMachines: Array.isArray(row.pausedMachines) ? row.pausedMachines : [],
+  }));
+  return normalized.sort((a, b) => a.windowStart.localeCompare(b.windowStart));
 }
 
 export async function putWorkOrder(row: WorkOrderRow): Promise<void> {

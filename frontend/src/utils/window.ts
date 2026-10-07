@@ -82,6 +82,45 @@ export function findMachineConflicts(
   return [...conflicts];
 }
 
+/** 占用源：一张仍在占用资源的作业单 */
+export interface OccupancySource extends TimeWindow {
+  id: string;
+  code: string;
+  members: string[];
+  machines: string[];
+}
+
+/**
+ * 恢复作业时按当前空闲重查：返回目标时间窗内被别的作业单占用的人员 / 机具。
+ * 只比对占用源（调用方需剔除已暂停 / 已完成以及本单），避免把暂停期间已被别的单占用的资源当成可用。
+ */
+export function findOccupiedResources(
+  target: TimeWindow,
+  sources: OccupancySource[],
+): { members: string[]; machines: string[]; memberBy: Record<string, string>; machineBy: Record<string, string> } {
+  const busyMembers = new Set<string>();
+  const busyMachines = new Set<string>();
+  const memberBy: Record<string, string> = {};
+  const machineBy: Record<string, string> = {};
+  for (const source of sources) {
+    if (!isOverlap(target, source)) continue;
+    for (const member of source.members) {
+      if (!busyMembers.has(member)) memberBy[member] = source.code;
+      busyMembers.add(member);
+    }
+    for (const machine of source.machines) {
+      if (!busyMachines.has(machine)) machineBy[machine] = source.code;
+      busyMachines.add(machine);
+    }
+  }
+  return {
+    members: [...busyMembers],
+    machines: [...busyMachines],
+    memberBy,
+    machineBy,
+  };
+}
+
 /**
  * 天窗可用时长占比（%）：当日全部作业单占用时长 / 当日可用天窗基准（默认 180 分钟）
  */

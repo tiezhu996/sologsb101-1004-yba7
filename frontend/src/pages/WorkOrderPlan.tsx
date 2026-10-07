@@ -53,6 +53,7 @@ import {
 import {
   MACHINE_LIBRARY,
   MEMBER_LIBRARY,
+  RESOURCE_OCCUPYING_STATES,
   WORK_ORDER_STATE_FLOW,
   WORK_ORDER_STATE_LABEL,
   buildWorkOrderCode,
@@ -106,10 +107,10 @@ export default function WorkOrderPlan() {
     form: defaultForm(),
   });
 
-  /** 当前表单的冲突预检结果 */
+  /** 当前表单的冲突预检结果（已暂停 / 已完成的单已释放资源，不参与占用） */
   const draftConflicts = useMemo(() => {
     const others = allOrderRows
-      .filter((item) => item.id !== dialog.editingId)
+      .filter((item) => item.id !== dialog.editingId && RESOURCE_OCCUPYING_STATES.includes(item.state))
       .map((item) => ({
         id: item.id,
         code: item.code,
@@ -360,7 +361,22 @@ export default function WorkOrderPlan() {
                         <Typography variant="subtitle2" fontWeight={600}>
                           {order.code}
                         </Typography>
-                        <Chip size="small" label={WORK_ORDER_STATE_LABEL[order.state]} color={order.state === 'done' ? 'success' : 'default'} />
+                        <Chip
+                          size="small"
+                          label={WORK_ORDER_STATE_LABEL[order.state]}
+                          color={
+                            order.state === 'done'
+                              ? 'success'
+                              : order.state === 'paused'
+                                ? 'warning'
+                                : 'default'
+                          }
+                        />
+                        {order.state === 'paused' ? (
+                          <Tooltip title={`暂停时间 ${order.pausedAt ?? '—'}`}>
+                            <Chip size="small" color="warning" variant="outlined" label={`已暂停：${order.pausedReason ?? '—'}`} />
+                          </Tooltip>
+                        ) : null}
                         {order.conflict ? (
                           <Tooltip title={`与 ${order.conflictCodes.join('、')} 时间窗重叠`}>
                             <Chip size="small" color="error" icon={<WarningAmberIcon />} label="时间窗冲突" />
@@ -370,13 +386,19 @@ export default function WorkOrderPlan() {
                         {order.machineConflict ? <Chip size="small" color="warning" label="机具占用冲突" /> : null}
                       </Stack>
                       <Stack direction="row" spacing={0.5}>
-                        <Button size="small" startIcon={<EditIcon />} onClick={() => openEdit(order)}>
+                        <Button
+                          size="small"
+                          startIcon={<EditIcon />}
+                          disabled={order.state === 'paused' || order.state === 'done'}
+                          onClick={() => openEdit(order)}
+                        >
                           编辑
                         </Button>
                         <Button
                           size="small"
                           color="error"
                           startIcon={<DeleteIcon />}
+                          disabled={order.state === 'paused'}
                           onClick={async () => {
                             await dispatch(deleteWorkOrder(order.id));
                             setToast('作业单已删除');
@@ -391,9 +413,15 @@ export default function WorkOrderPlan() {
                       {order.leader}
                     </Typography>
                     <Typography variant="caption" color="text.secondary" display="block">
-                      关联病害 {order.faultIds.length} 处（待销号 {order.pendingFaultCount}）· 涉及站场{' '}
+                      关联病害 {order.faultIds.length} 处（待销号 {order.pendingFaultCount}
+                      {order.processedFaultCount > 0 ? ` · 暂停已处理 ${order.processedFaultCount}` : ''}）· 涉及站场{' '}
                       {order.yardNames.join('、') || '—'}
                     </Typography>
+                    {order.state === 'paused' ? (
+                      <Typography variant="caption" color="warning.main" display="block">
+                        暂停期间人员机具已释放，请到「作业进度与销号回写」页恢复并重新核定资源。
+                      </Typography>
+                    ) : null}
                     <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap mt={0.75}>
                       {order.members.map((member) => (
                         <Chip key={member} size="small" variant="outlined" label={`人 ${member}`} />

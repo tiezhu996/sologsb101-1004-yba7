@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 评定病害等级（轻 / 中 / 重）、批量调整、批量升级、手工销号与撤销
 - 勾选待修病害编排天窗作业单，分配时间窗 / 负责人 / 作业人员 / 机具，并做**时间窗 + 人员 + 机具三重冲突校验**
 - 按天窗批次推进状态（待编排 → 已下达 → 作业中 → 已完成），推进到已完成时**自动回写病害销号**
+- **作业中可中途暂停**：登记暂停原因与时间、勾选本次已处理病害销号并摘出本单，同时释放占用的人员 / 机具；恢复时二选一——**按当前空闲重查**（实时核对占用，已被别的单占用的资源不可选）或**沿用旧安排**（快照资源已被占用则拦截），恢复草稿只带剩余病害
 - 登记慢行 / 封锁条件，查看结构版本并导出 / 导入整库 JSON
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -53,7 +54,7 @@ docker compose up -d --build # 代码改动后重建
 | `/inspections` | 巡检与病害录入 | 按巡检批次录入病害并定位到部件 |
 | `/faults` | 病害评定与销号 | 评定等级、批量调整、手工销号与撤销 |
 | `/workorders` | 天窗作业单编排 | 勾选病害成单、分配时间窗与人员机具并校验冲突 |
-| `/progress` | 作业进度与销号回写 | 更新状态，完成项自动回写病害销号 |
+| `/progress` | 作业进度与销号回写 | 更新状态，暂停登记 / 恢复重排，完成项自动回写病害销号 |
 | `/backup` | 封锁条件与版本 | 登记慢行 / 封锁条件，结构版本与 JSON 管理 |
 
 > 路由使用 `createBrowserRouter`（History 模式），真实路径 `/yards`、`/workorders` 等可直接访问，
@@ -93,7 +94,7 @@ sologsb101-1004/
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbrailswitch`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记 v1 → v2 的 `upgrade` 迁移（补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记 v1 → v2、v2 → v3 的 `upgrade` 迁移（v2 补齐行修订号、迁移 `faultType → type` / `faultPart → part`、`faultIds` 字符串拆分为数组、新增 `restrictions` 与 `settings` 表；v3 为作业单补齐暂停 / 恢复字段 `pausedReason` / `pausedAt` / `processedFaultIds` / `pausedMembers` / `pausedMachines`）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |

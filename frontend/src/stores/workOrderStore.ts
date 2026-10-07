@@ -21,8 +21,11 @@ import {
 } from '../utils/db';
 import {
   WORK_ORDER_STATE_FLOW,
+  RESOURCE_OCCUPYING_STATES,
   buildWorkOrderCode,
   type WorkOrderDraft,
+  type WorkOrderPauseInput,
+  type WorkOrderResumeDraft,
   type WorkOrderState,
   type WorkOrderView,
 } from '../types/workOrder';
@@ -30,8 +33,10 @@ import {
   findConflicts,
   findMachineConflicts,
   findMemberConflicts,
+  findOccupiedResources,
   nowDateTime,
   windowMinutes,
+  type TimeWindow,
 } from '../utils/window';
 import { emitChange } from '../utils/events';
 
@@ -57,6 +62,20 @@ const initialState: WorkOrderStateSlice = {
   loading: false,
   error: '',
 };
+
+/** 归一化作业单行：兼容 v2 及更早快照中缺失的暂停 / 恢复字段 */
+function normalizeWorkOrder(row: WorkOrderRow): WorkOrderRow {
+  return {
+    ...row,
+    pausedReason: row.pausedReason ?? null,
+    pausedAt: row.pausedAt ?? null,
+    processedFaultIds: Array.isArray(row.processedFaultIds) ? row.processedFaultIds : [],
+    pausedMembers: Array.isArray(row.pausedMembers) ? row.pausedMembers : [],
+    pausedMachines: Array.isArray(row.pausedMachines) ? row.pausedMachines : [],
+    members: Array.isArray(row.members) ? row.members : [],
+    machines: Array.isArray(row.machines) ? row.machines : [],
+  };
+}
 
 export const loadWorkOrderData = createAsyncThunk<
   {
@@ -93,12 +112,14 @@ export const createWorkOrder = createAsyncThunk<
     const state = getState().workOrder;
     const conflicts = findConflicts(
       { id: 'pending', windowStart: draft.windowStart, windowEnd: draft.windowEnd },
-      state.workOrders.map((item) => ({
-        id: item.id,
-        code: item.code,
-        windowStart: item.windowStart,
-        windowEnd: item.windowEnd,
-      })),
+      state.workOrders
+        .filter((item) => RESOURCE_OCCUPYING_STATES.includes(item.state))
+        .map((item) => ({
+          id: item.id,
+          code: item.code,
+          windowStart: item.windowStart,
+          windowEnd: item.windowEnd,
+        })),
     ).map((item) => item.code);
 
     await putWorkOrder({
@@ -111,6 +132,11 @@ export const createWorkOrder = createAsyncThunk<
       machines: draft.machines,
       members: draft.members,
       state: 'planned',
+      pausedReason: null,
+      pausedAt: null,
+      processedFaultIds: [],
+      pausedMembers: [],
+      pausedMachines: [],
       createdAt: nowDateTime(),
       updatedAt: nowDateTime(),
       revision: ROW_REVISION,
@@ -131,6 +157,7 @@ export const updateWorkOrder = createAsyncThunk<
     const state = getState().workOrder;
     const existing = state.workOrders.find((item) => item.id === id);
     if (!existing) return;
+    if (existing.state === 'paused' || existing.state === 'done') return;
     await putWorkOrder({
       ...existing,
       code: draft.code.trim(),
@@ -163,6 +190,10 @@ export const advanceWorkOrder = createAsyncThunk<
     if (!existing) return { state: next, solvedCount: 0 };
     const allowed = WORK_ORDER_STATE_FLOW[existing.state];
     if (!allowed.includes(next)) return { state: existing.state, solvedCount: 0 };
+    // 暂停态恢复必须走 resumeWorkOrder（重新核定人员机具），不允许直接推进
+    if (existing.state === 'paused' && next === 'working') {
+      return rejectWithValue('暂停单请通过「恢复作业」重新核定人员机具');
+    }
 
     let solvedCount = 0;
     if (next === 'done') {
@@ -188,17 +219,169 @@ export const advanceWorkOrder = createAsyncThunk<
   }
 });
 
-export const deleteWorkOrder = createAsyncThunk<void, string, { rejectValue: string }>(
-  'workOrder/delete',
-  async (id, { rejectWithValue }) => {
-    try {
-      await removeWorkOrder(id);
-      emitChange();
-    } catch (error) {
-      return rejectWithValue(error instanceof Error ? error.message : '删除作业单失败');
+/**
+ * 作业中暂停：
+ * - 登记暂停原因与时间；
+ * - 把本次已处理病害销号并从本单摘除（释放后的作业单只保留剩余病害）；
+ * - 清空本单占用的人员 / 机具（保留快照供恢复时沿用旧安排比对）。
+ */
+export const pauseWorkOrder = createAsyncThunk<
+  { solvedCount: number; remainingCount: number },
+  { id: string; input: WorkOrderPauseInput },
+  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
+>('workOrder/pause', async ({ id, input }, { getState, rejectWithValue }) => {
+  try {
+    const state = getState().workOrder;
+    const existing = state.workOrders.find((item) => item.id === id);
+    if (!existing) return rejectWithValue('作业单不存在');
+    if (existing.state !== 'working') return rejectWithValue('仅作业中的作业单可以暂停');
+
+    const remainingFaults = state.faults.filter(
+      (item) => existing.faultIds.includes(item.id) && item.state === 'pending',
+    );
+    if (remainingFaults.length === 0) {
+      return rejectWithValue('关联病害已全部处理，请直接推进为已完成');
     }
-  },
-);
+    const reason = input.reason.trim();
+    if (!reason) return rejectWithValue('请登记暂停原因');
+
+    const solvedIds = input.solvedFaultIds.filter((faultId) => existing.faultIds.includes(faultId));
+    const solvedRows = state.faults.filter(
+      (item) => solvedIds.includes(item.id) && item.state === 'pending',
+    );
+    if (solvedRows.length > 0) {
+      await putFaults(
+        solvedRows.map((item) => ({ ...item, state: 'solved' as const, solvedAt: nowDateTime() })),
+      );
+    }
+    const solvedSet = new Set(solvedRows.map((item) => item.id));
+    const remainingIds = existing.faultIds.filter(
+      (faultId) => !solvedSet.has(faultId) && state.faults.some((f) => f.id === faultId && f.state === 'pending'),
+    );
+    if (remainingIds.length === 0) {
+      return rejectWithValue('剩余待修病害为 0，无法暂停，请直接推进为已完成');
+    }
+
+    await putWorkOrder({
+      ...existing,
+      state: 'paused',
+      faultIds: remainingIds,
+      processedFaultIds: [...existing.processedFaultIds, ...solvedRows.map((item) => item.id)],
+      pausedReason: reason,
+      pausedAt: input.pausedAt?.trim() || nowDateTime(),
+      // 暂停即释放人员机具，旧安排进快照
+      members: [],
+      machines: [],
+      pausedMembers: existing.members,
+      pausedMachines: existing.machines,
+      updatedAt: nowDateTime(),
+    });
+    emitChange();
+    return { solvedCount: solvedRows.length, remainingCount: remainingIds.length };
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '暂停作业单失败');
+  }
+});
+
+/**
+ * 恢复作业：只带剩余病害生成恢复草稿（新时间窗 + 重新核定的人员机具）后回到作业中。
+ * - recheck（按当前空闲重查）：所选人员 / 机具在新时间窗内不得被其它占用单占用；
+ * - reuse（沿用旧安排）：暂停快照中的人员 / 机具在新时间窗内被别的单占用时拒绝恢复。
+ */
+export const resumeWorkOrder = createAsyncThunk<
+  { state: WorkOrderState },
+  { id: string; draft: WorkOrderResumeDraft },
+  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
+>('workOrder/resume', async ({ id, draft }, { getState, rejectWithValue }) => {
+  try {
+    const state = getState().workOrder;
+    const existing = state.workOrders.find((item) => item.id === id);
+    if (!existing) return rejectWithValue('作业单不存在');
+    if (existing.state !== 'paused') return rejectWithValue('仅已暂停的作业单可以恢复');
+    if (existing.faultIds.length === 0) return rejectWithValue('该单已无剩余病害，请直接归档');
+
+    if (windowMinutes({ windowStart: draft.windowStart, windowEnd: draft.windowEnd }) <= 0) {
+      return rejectWithValue('天窗止必须晚于天窗起');
+    }
+    if (!draft.leader.trim()) return rejectWithValue('请选择负责人');
+    if (draft.members.length === 0) return rejectWithValue('请分配作业人员');
+    if (draft.machines.length === 0) return rejectWithValue('请分配机具');
+
+    const occupying = state.workOrders
+      .filter((item) => item.id !== existing.id && RESOURCE_OCCUPYING_STATES.includes(item.state))
+      .map((item) => ({
+        id: item.id,
+        code: item.code,
+        windowStart: item.windowStart,
+        windowEnd: item.windowEnd,
+        members: item.members,
+        machines: item.machines,
+      }));
+    const occupied = findOccupiedResources(
+      { windowStart: draft.windowStart, windowEnd: draft.windowEnd },
+      occupying,
+    );
+    if (draft.mode === 'reuse') {
+      const busyMembers = draft.members.filter((name) => occupied.members.includes(name));
+      const busyMachines = draft.machines.filter((name) => occupied.machines.includes(name));
+      if (busyMembers.length > 0 || busyMachines.length > 0) {
+        const details = [
+          busyMembers.length > 0
+            ? `人员 ${busyMembers.map((name) => `${name}（占用方 ${occupied.memberBy[name]}）`).join('、')}`
+            : '',
+          busyMachines.length > 0
+            ? `机具 ${busyMachines.map((name) => `${name}（占用方 ${occupied.machineBy[name]}）`).join('、')}`
+            : '',
+        ]
+          .filter(Boolean)
+          .join('；');
+        return rejectWithValue(`旧安排已有资源被别的单占用：${details}，请改用「按当前空闲重查」`);
+      }
+    } else {
+      const busyMembers = draft.members.filter((name) => occupied.members.includes(name));
+      const busyMachines = draft.machines.filter((name) => occupied.machines.includes(name));
+      if (busyMembers.length > 0 || busyMachines.length > 0) {
+        return rejectWithValue('所选资源在当前时间窗已被占用，请移除标红的人员 / 机具');
+      }
+    }
+
+    await putWorkOrder({
+      ...existing,
+      state: 'working',
+      windowStart: draft.windowStart,
+      windowEnd: draft.windowEnd,
+      leader: draft.leader.trim(),
+      members: draft.members,
+      machines: draft.machines,
+      pausedReason: null,
+      pausedAt: null,
+      pausedMembers: [],
+      pausedMachines: [],
+      updatedAt: nowDateTime(),
+    });
+    emitChange();
+    return { state: 'working' };
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '恢复作业单失败');
+  }
+});
+
+export const deleteWorkOrder = createAsyncThunk<
+  void,
+  string,
+  { rejectValue: string; state: { workOrder: WorkOrderStateSlice } }
+>('workOrder/delete', async (id, { getState, rejectWithValue }) => {
+  try {
+    const existing = getState().workOrder.workOrders.find((item) => item.id === id);
+    if (existing?.state === 'paused') {
+      return rejectWithValue('暂停中的作业单不能删除，请先恢复或完成');
+    }
+    await removeWorkOrder(id);
+    emitChange();
+  } catch (error) {
+    return rejectWithValue(error instanceof Error ? error.message : '删除作业单失败');
+  }
+});
 
 const workOrderSlice = createSlice({
   name: 'workOrder',
@@ -225,7 +408,7 @@ const workOrderSlice = createSlice({
       })
       .addCase(loadWorkOrderData.fulfilled, (state, action) => {
         state.loading = false;
-        state.workOrders = action.payload.workOrders;
+        state.workOrders = action.payload.workOrders.map(normalizeWorkOrder);
         state.faults = action.payload.faults;
         state.inspections = action.payload.inspections;
         state.switches = action.payload.switches;
@@ -269,7 +452,9 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
             .filter((name): name is string => Boolean(name)),
         ),
       ];
-      const others = workOrders.filter((item) => item.id !== order.id);
+      const others = workOrders.filter(
+        (item) => item.id !== order.id && RESOURCE_OCCUPYING_STATES.includes(item.state),
+      );
       const conflictCodes = others
         .filter((item) => item.windowStart < order.windowEnd && order.windowStart < item.windowEnd)
         .map((item) => item.code);
@@ -303,6 +488,9 @@ export function selectWorkOrderViews(state: RootLike): WorkOrderView[] {
         memberConflict: memberConflicts.length > 0,
         machineConflict: machineConflicts.length > 0,
         pendingFaultCount: related.filter((item) => item.state === 'pending').length,
+        processedFaultCount:
+          order.processedFaultIds.length + related.filter((item) => item.state === 'solved').length,
+        totalFaultCount: order.processedFaultIds.length + related.length,
       };
     })
     .sort((a, b) => a.windowStart.localeCompare(b.windowStart));
@@ -344,5 +532,35 @@ export function selectWindowStats(state: RootLike): {
     occupationRate: Number(((minutes / 180) * 100).toFixed(1)),
     conflictCount: views.filter((item) => item.conflict).length,
     doneCount: views.filter((item) => item.state === 'done').length,
+  };
+}
+
+/** 恢复作业：给定作业单与拟定时间窗，按当前占用关系返回人员 / 机具空闲情况 */
+export function selectResumeAvailability(
+  state: RootLike,
+  orderId: string,
+  window: TimeWindow,
+): {
+  busyMembers: string[];
+  busyMachines: string[];
+  memberBy: Record<string, string>;
+  machineBy: Record<string, string>;
+} {
+  const sources = state.workOrder.workOrders
+    .filter((item) => item.id !== orderId && RESOURCE_OCCUPYING_STATES.includes(item.state))
+    .map((item) => ({
+      id: item.id,
+      code: item.code,
+      windowStart: item.windowStart,
+      windowEnd: item.windowEnd,
+      members: item.members,
+      machines: item.machines,
+    }));
+  const occupied = findOccupiedResources(window, sources);
+  return {
+    busyMembers: occupied.members,
+    busyMachines: occupied.machines,
+    memberBy: occupied.memberBy,
+    machineBy: occupied.machineBy,
   };
 }
